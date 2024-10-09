@@ -1,0 +1,4 @@
+secrets:
+  - name: dummy-secret
+    resourceVersion: "123456"
+
