@@ -1,0 +1,85 @@
+pipeline {
+    agent any
+    environment {
+        KUBE_CONTEXT = 'm3mb.yaml' // Kubernetes context
+        CONFIG_FILE = 'config.yaml' // YAML config file path
+        RESOURCE_VERSION_FILE = 'stored_resource_version.yaml' // To store resource versions
+    }
+    stages {
+        stage('Setup') {
+            steps {
+                script {
+                    // Set Kubernetes context
+                    sh "kubectl config use-context ${KUBE_CONTEXT}"
+                }
+            }
+        }
+        stage('Process Configuration') {
+            steps {
+                script {
+                    // Load and parse the YAML configuration
+                    def config = readYaml file: CONFIG_FILE
+                    config.origins.each { origin ->
+                        def sourceNamespace = origin.namespace
+                        def destinationNamespace = origin.destination // Define destinationNamespace from config
+
+                        // Iterate through each secret
+                        origin.secrets.each { secret ->
+                            def secretName = secret.secret
+                            def storedVersion = secret.resourceVersion
+                            
+                            // Retrieve the current resourceVersion from the cluster
+                            try {
+                                def currentVersion = sh(
+                                    script: "kubectl get secret ${secretName} -n ${sourceNamespace} -o jsonpath='{.metadata.resourceVersion}'", 
+                                    returnStdout: true
+                                ).trim()
+                                
+                                // Check if the secret needs to be copied
+                                if (currentVersion != storedVersion) {
+                                    echo "Secret ${secretName} resourceVersion changed. Updating in destination."
+                                    
+                                    // Retrieve and modify the secret YAML for the destination namespace
+                                    def secretYaml = sh(
+                                        script: "kubectl get secret ${secretName} -n ${sourceNamespace} -o yaml", 
+                                        returnStdout: true
+                                    ).trim()
+                                    
+                                    // Apply the secret to the destination namespace
+                                    sh """
+                                        echo '${secretYaml}' | sed 's/namespace: ${sourceNamespace}/namespace: ${destinationNamespace}/g' | kubectl apply -f -
+                                    """
+                                    
+                                    // Update stored resourceVersion in the file and commit the change
+                                    updateStoredResourceVersion(secretName, currentVersion)
+                                } else {
+                                    echo "Secret ${secretName} resourceVersion unchanged. Skipping."
+                                }
+                            } catch (Exception e) {
+                                echo "Error processing secret ${secretName}: ${e.message}"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Function to update resourceVersion in the file
+def updateStoredResourceVersion(secretName, newVersion) {
+    def resourceVersionContent = readFile(RESOURCE_VERSION_FILE)
+    def updatedContent = resourceVersionContent.replaceAll(/(?<=name: ${secretName}\n\s*resourceVersion: ).*/, "${newVersion}")
+    writeFile file: RESOURCE_VERSION_FILE, text: updatedContent
+    
+    withCredentials([usernamePassword(credentialsId: 'gitCredentials', passwordVariable: 'GIT_PASS', usernameVariable: 'GIT_USER')]) {
+        sh """
+            git config --local user.name "${GIT_USER}"
+            git config --local user.email "${GIT_USER}@example.com"
+            git add ${RESOURCE_VERSION_FILE}
+            git commit -m 'Updated resourceVersion for ${secretName} on $(date)'
+            git push origin secret-cert
+        """
+    }
+}
+
