@@ -1,86 +1,99 @@
 pipeline {
     agent any
+
     environment {
-        CONFIG_FILE = '/root/.kube/config' // Adjusted path
-        RESOURCE_VERSION_FILE = 'resource_version.txt'
+        NAMESPACE_SOURCE = 'sha'  // Source namespace
+        NAMESPACES_TARGET = "tri,sra"  // Target namespaces
+        SECRET_NAME = 'my-tls-secret'  // Secret to propagate
+        RESOURCE_VERSION_FILE = 'resource_version.txt'  // File to store the resource version
         AWS_DEFAULT_REGION = 'us-west-2'
         CLUSTER_NAME = 'certs'
+        KUBE_CONTEXT = 'arn:aws:eks:us-west-2:340752821725:cluster/certs'
     }
+
     stages {
-        stage('Setup') {
+        stage('Initialize') {
             steps {
                 script {
-                    // Configure AWS CLI and update kubeconfig
-                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-credentials']]) {
-                        sh "aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${AWS_DEFAULT_REGION} --kubeconfig ${CONFIG_FILE}"
-                        env.EKS_ENDPOINT = sh(script: "aws eks describe-cluster --name ${CLUSTER_NAME} --query cluster.endpoint --output text", returnStdout: true).trim()
+                    // Ensure the resource version file exists
+                    if (!fileExists(RESOURCE_VERSION_FILE)) {
+                        writeFile file: RESOURCE_VERSION_FILE, text: '0'
                     }
                 }
             }
         }
-        stage('Process Configuration') {
+
+        stage('Setup AWS and Kubeconfig') {
             steps {
                 script {
-                    withKubeConfig(credentialsId: 'jenkins-sa-token') {
-                        // Load and parse the YAML configuration
-                        def config = readYaml file: CONFIG_FILE
+                    // Set up AWS credentials and update kubeconfig for EKS access
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-credentials']]) {
+                        sh "aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${AWS_DEFAULT_REGION}"
+                    }
+                }
+            }
+        }
 
-                        config.origins.each { origin ->
-                            def sourceNamespace = origin.namespace
+        stage('Get and Check Resource Version') {
+            steps {
+                script {
+                    withKubeConfig(credentialsId: 'jenkins-sa-token', serverUrl: 'https://34C14598A0592BA431A023EF404765AE.gr7.us-west-2.eks.amazonaws.com') {
+                        // Retrieve the current resource version of the secret in the source namespace
+                        env.CURRENT_RESOURCE_VERSION = sh(
+                            script: "kubectl get secret ${SECRET_NAME} -n ${NAMESPACE_SOURCE} -o jsonpath='{.metadata.resourceVersion}'",
+                            returnStdout: true
+                        ).trim()
+                        
+                        // Read the stored resource version
+                        def storedResourceVersion = readFile(RESOURCE_VERSION_FILE).trim()
+                        
+                        // Check if an update is needed
+                        env.NEED_UPDATE = (env.CURRENT_RESOURCE_VERSION != storedResourceVersion)
+                    }
+                }
+            }
+        }
 
-                            origin.secrets.each { secret ->
-                                def secretName = secret.secret
-                                def storedVersion = secret.resourceVersion
+        stage('Update Secrets in Target Namespaces') {
+            when {
+                expression { env.NEED_UPDATE == 'true' }
+            }
+            steps {
+                script {
+                    withKubeConfig(credentialsId: 'jenkins-sa-token', serverUrl: 'https://34C14598A0592BA431A023EF404765AE.gr7.us-west-2.eks.amazonaws.com') {
+                        // Download the secret YAML and apply it to target namespaces
+                        def secretYaml = sh(
+                            script: "kubectl get secret ${SECRET_NAME} -n ${NAMESPACE_SOURCE} -o yaml",
+                            returnStdout: true
+                        ).trim()
 
-                                def currentVersion = sh(
-                                    script: "kubectl get secret ${secretName} -n ${sourceNamespace} -o jsonpath='{.metadata.resourceVersion}' || echo 'not_found'",
-                                    returnStdout: true
-                                ).trim()
+                        // Apply the secret to each target namespace
+                        env.NAMESPACES_TARGET.split(',').each { namespace ->
+                            writeFile file: 'temp_secret.yaml', text: secretYaml.replaceAll("namespace: ${NAMESPACE_SOURCE}", "namespace: ${namespace.trim()}")
+                            sh "kubectl apply -f temp_secret.yaml -n ${namespace.trim()}"
+                        }
 
-                                if (currentVersion != 'not_found' && currentVersion != storedVersion) {
-                                    echo "Secret ${secretName} resourceVersion changed. Triggering refresh."
-
-                                    def secretYaml = sh(
-                                        script: "kubectl get secret ${secretName} -n ${sourceNamespace} -o yaml",
-                                        returnStdout: true
-                                    ).trim()
-
-                                    origin.destinations.each { destination ->
-                                        echo "Applying secret ${secretName} to namespace ${destination}."
-                                        writeFile file: 'temp_secret.yaml', text: secretYaml.replaceAll("namespace: ${sourceNamespace}", "namespace: ${destination}")
-                                        sh "kubectl apply -f temp_secret.yaml -n ${destination}"
-                                    }
-
-                                    updateStoredResourceVersion(secretName, currentVersion)
-                                } else {
-                                    echo "Secret ${secretName} resourceVersion unchanged. Skipping refresh."
-                                }
-                            }
+                        // Update and commit the new resource version
+                        writeFile file: RESOURCE_VERSION_FILE, text: env.CURRENT_RESOURCE_VERSION
+                        withCredentials([usernamePassword(credentialsId: 'gitCredentials', passwordVariable: 'GIT_PASS', usernameVariable: 'GIT_USER')]) {
+                            sh '''
+                                git config --global user.email "jenkins@example.com"  // Replace with your email
+                                git config --global user.name "Jenkins"
+                                git add ${RESOURCE_VERSION_FILE}
+                                git commit -m "Updated resource version to ${CURRENT_RESOURCE_VERSION}"
+                                git push origin main  // Replace with your branch name if necessary
+                            '''
                         }
                     }
                 }
             }
         }
     }
+
     post {
         always {
-            cleanWs()
+            echo "Pipeline finished."
+            cleanWs() // Clean up workspace after the build
         }
-    }
-}
-
-def updateStoredResourceVersion(secretName, newVersion) {
-    def resourceVersionContent = readFile(RESOURCE_VERSION_FILE)
-    def updatedContent = resourceVersionContent.replaceAll(/(?<=name: ${secretName}\\n\\s*resourceVersion: )".*"/, "\"${newVersion}\"")
-    writeFile file: RESOURCE_VERSION_FILE, text: updatedContent
-
-    withCredentials([usernamePassword(credentialsId: 'gitCredentials', passwordVariable: 'GIT_PASS', usernameVariable: 'GIT_USER')]) {
-        sh """
-            git config --local user.name "${GIT_USER}"
-            git config --local user.email "${GIT_USER}@example.com"
-            git add ${RESOURCE_VERSION_FILE}
-            git commit -m 'Updated resourceVersion for ${secretName} on \$(date)'
-            git push origin main
-        """
     }
 }
