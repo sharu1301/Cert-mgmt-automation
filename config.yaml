@@ -2,8 +2,6 @@ origins:
   - namespace: cert-manager-namespace  # The namespace where Cert-Manager is installed
     secrets:
       - secret: dummy-secret            # Name of the secret to monitor
-        resourceVersion: "123456"       # Initial version (this will update automatically)
         destinations:
-          - namespace1                  # Destination namespace 1
-          - namespace2                  # Destination namespace 2
-
+          - tri                        # Change namespace1 to tri
+          - sra                        # Change namespace2 to sra
