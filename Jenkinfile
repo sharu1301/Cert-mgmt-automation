@@ -2,9 +2,9 @@ pipeline {
     agent any
 
     environment {
-        NAMESPACE_SOURCE = 'sha'  // Source namespace
-        NAMESPACES_TARGET = "tri,sra"  // Target namespaces
-        SECRET_NAME = 'my-tls-secret'  // Secret to propagate
+        SOURCE_NAMESPACES = "tri,sra"        // Source namespaces
+        TARGET_NAMESPACE = 'sha'             // Target namespace to copy the cert to
+        SECRET_NAME = 'my-tls-secret'        // Secret to propagate
         RESOURCE_VERSION_FILE = 'resource_version.txt'  // File to store the resource version
         AWS_DEFAULT_REGION = 'us-west-2'
         CLUSTER_NAME = 'certs'
@@ -34,53 +34,64 @@ pipeline {
             }
         }
 
-        stage('Get and Check Resource Version') {
+        stage('Get and Check Resource Version from Source Namespaces') {
             steps {
                 script {
                     withKubeConfig(credentialsId: 'jenkins-sa-token', serverUrl: 'https://34C14598A0592BA431A023EF404765AE.gr7.us-west-2.eks.amazonaws.com') {
-                        // Retrieve the current resource version of the secret in the source namespace
-                        env.CURRENT_RESOURCE_VERSION = sh(
-                            script: "kubectl get secret ${SECRET_NAME} -n ${NAMESPACE_SOURCE} -o jsonpath='{.metadata.resourceVersion}'",
-                            returnStdout: true
-                        ).trim()
-                        
-                        // Read the stored resource version
                         def storedResourceVersion = readFile(RESOURCE_VERSION_FILE).trim()
-                        
-                        // Check if an update is needed
-                        env.NEED_UPDATE = (env.CURRENT_RESOURCE_VERSION != storedResourceVersion)
+                        def latestResourceVersion = storedResourceVersion
+                        def sourceNamespaceToUse = null
+
+                        // Loop through source namespaces to find the latest resource version
+                        SOURCE_NAMESPACES.split(',').each { namespace ->
+                            def currentResourceVersion = sh(
+                                script: "kubectl get secret ${SECRET_NAME} -n ${namespace.trim()} -o jsonpath='{.metadata.resourceVersion}'",
+                                returnStdout: true
+                            ).trim()
+
+                            // Check if current namespace has a more recent version
+                            if (currentResourceVersion > latestResourceVersion) {
+                                latestResourceVersion = currentResourceVersion
+                                sourceNamespaceToUse = namespace.trim()
+                            }
+                        }
+
+                        // Set the resource version and namespace to use if an update is needed
+                        env.NEED_UPDATE = (latestResourceVersion != storedResourceVersion)
+                        env.SOURCE_NAMESPACE_TO_USE = sourceNamespaceToUse
+                        env.LATEST_RESOURCE_VERSION = latestResourceVersion
                     }
                 }
             }
         }
 
-        stage('Update Secrets in Target Namespaces') {
+        stage('Update Secret in Target Namespace') {
             when {
-                expression { env.NEED_UPDATE == 'true' }
+                expression { env.NEED_UPDATE == 'true' && env.SOURCE_NAMESPACE_TO_USE != null }
             }
             steps {
                 script {
                     withKubeConfig(credentialsId: 'jenkins-sa-token', serverUrl: 'https://34C14598A0592BA431A023EF404765AE.gr7.us-west-2.eks.amazonaws.com') {
-                        // Download the secret YAML and apply it to target namespaces
+                        // Download the secret YAML from the source namespace with the latest version
                         def secretYaml = sh(
-                            script: "kubectl get secret ${SECRET_NAME} -n ${NAMESPACE_SOURCE} -o yaml",
+                            script: "kubectl get secret ${SECRET_NAME} -n ${SOURCE_NAMESPACE_TO_USE} -o yaml",
                             returnStdout: true
                         ).trim()
 
-                        // Apply the secret to each target namespace
-                        env.NAMESPACES_TARGET.split(',').each { namespace ->
-                            writeFile file: 'temp_secret.yaml', text: secretYaml.replaceAll("namespace: ${NAMESPACE_SOURCE}", "namespace: ${namespace.trim()}")
-                            sh "kubectl apply -f temp_secret.yaml -n ${namespace.trim()}"
-                        }
+                        // Remove the source namespace metadata and update it for the target namespace
+                        writeFile file: 'temp_secret.yaml', text: secretYaml.replaceAll("namespace: ${SOURCE_NAMESPACE_TO_USE}", "namespace: ${TARGET_NAMESPACE}")
+
+                        // Apply the secret to the target namespace
+                        sh "kubectl apply -f temp_secret.yaml -n ${TARGET_NAMESPACE}"
 
                         // Update and commit the new resource version
-                        writeFile file: RESOURCE_VERSION_FILE, text: env.CURRENT_RESOURCE_VERSION
+                        writeFile file: RESOURCE_VERSION_FILE, text: env.LATEST_RESOURCE_VERSION
                         withCredentials([usernamePassword(credentialsId: 'gitCredentials', passwordVariable: 'GIT_PASS', usernameVariable: 'GIT_USER')]) {
                             sh '''
                                 git config --global user.email "jenkins@example.com"  // Replace with your email
                                 git config --global user.name "Jenkins"
                                 git add ${RESOURCE_VERSION_FILE}
-                                git commit -m "Updated resource version to ${CURRENT_RESOURCE_VERSION}"
+                                git commit -m "Updated resource version to ${LATEST_RESOURCE_VERSION}"
                                 git push origin main  // Replace with your branch name if necessary
                             '''
                         }
